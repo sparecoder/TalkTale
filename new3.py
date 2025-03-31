@@ -21,7 +21,7 @@ def create_tutor_prompt(interests):
     return {
         "role": "system",
         "content": f"""You are an engaging English conversation partner. The user is interested in: {interests}. Your goals are:
-1. Maintain natural, flowing dialogue about the user's interests
+1. Maintain natural, flowing dialoe about the user's interests
 2. Ask thoughtful follow-up questions
 3. Expand on topics the user mentions
 4. Use appropriate vocabulary related to the discussion topics
