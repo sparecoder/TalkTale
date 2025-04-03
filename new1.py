@@ -6,54 +6,35 @@ from groq import Groq
 from tempfile import NamedTemporaryFile
 import os
 from pydub import AudioSegment
-import language_tool_python
 import numpy as np
 from scipy.io import wavfile
-import statistics
+import language_tool_python
 
 # Initialize APIs and tools
 client = Groq(api_key="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")
 model = whisper.load_model("base")
+language_tool = language_tool_python.LanguageToolPublicAPI('en-US')
 
-# Initialize LanguageTool (local or remote)
-try:
-    language_tool = language_tool_python.LanguageTool('en-US')  # Local server
-except Exception:
-    print("Falling back to public API...")
-    language_tool = language_tool_python.LanguageToolPublicAPI('en-US')  # Remote API fallback
-
-# System prompt for English tutoring
-TUTOR_PROMPT = {
-    "role": "system",
-    "content": """You are a friendly English conversation tutor. Your objectives are:
-1. Engage in natural dialogues while correcting grammar.
-2. Highlight 1-2 key improvements per interaction.
-3. Suggest better vocabulary/phrases.
-4. Ask follow-up questions to continue practice.
-5. Maintain an encouraging tone with positive reinforcement.
-
-Respond using this format:
-**Correction:** [if needed, otherwise omit]
-[Regular response with follow-up question]"""
-}
+# System prompt with interest integration
+def TUTOR_PROMPT(interests):
+    return {
+        "role": "system",
+        "content": f"""You are an English conversation partner. Follow these rules:
+1. Keep responses conversational (1-2 sentences max).
+2. Focus on {interests} when possible.
+3. After each response, add:
+##Improvements: [1-2 key areas].
+##Suggestions: [better alternatives].
+4. Always ask engaging questions.
+5. Be supportive and friendly."""
+    }
 
 chat_history = []
+user_interests = "general topics"  # Default interests
 
 def speech_to_text(audio_path):
     result = model.transcribe(audio_path)
     return result["text"]
-
-def generate_response(user_input):
-    chat_history.append({"role": "user", "content": user_input})
-    messages = [TUTOR_PROMPT] + chat_history
-    response = client.chat.completions.create(
-        messages=messages,
-        model="llama3-8b-8192",
-        temperature=0.7
-    )
-    full_response = response.choices[0].message.content
-    chat_history.append({"role": "assistant", "content": full_response})
-    return full_response
 
 def text_to_speech(text):
     tts = gTTS(text=text, lang='en', slow=False)
@@ -63,122 +44,186 @@ def text_to_speech(text):
     os.unlink(fp.name)
     return f'<audio autoplay><source src="data:audio/mpeg;base64,{audio_data}"></audio>'
 
-def calculate_fluency(audio_path, transcription):
-    audio = AudioSegment.from_file(audio_path)
-    duration = len(audio) / 1000  # Seconds
-    word_count = len(transcription.split())
-    
-    # Basic speech rate
-    speech_rate = word_count / duration
-    
-    # Pause analysis (simplified)
-    sample_rate, audio_data = wavfile.read(audio_path)
-    audio_data = audio_data / np.max(np.abs(audio_data))
-    is_speech = np.abs(audio_data) > 0.1
-    pauses = np.diff(is_speech.astype(int))
-    pause_count = np.sum(pauses == 1)
-    
-    # Articulation rate (speech rate without pauses)
-    speaking_time = np.sum(is_speech) / sample_rate
-    articulation_rate = word_count / speaking_time if speaking_time > 0 else 0
-    
-    return {
-        'speech_rate': speech_rate,
-        'articulation_rate': articulation_rate,
-        'pause_frequency': pause_count / duration
-    }
+def calculate_fluency_metrics(audio_path, transcription):
+    # Calculate speech rate and other metrics
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        duration = len(audio) / 1000  # Convert to seconds
+        
+        # Word count
+        words = transcription.split()
+        word_count = len(words)
+        
+        # Calculate speech rate (words per minute)
+        speech_rate = (word_count / duration) * 60 if duration > 0 else 0
+        
+        # Convert audio to numpy array for pause analysis
+        sample_rate, audio_data = wavfile.read(audio_path)
+        if len(audio_data.shape) > 1:  # If stereo, convert to mono
+            audio_data = np.mean(audio_data, axis=1)
+            
+        # Normalize audio
+        audio_data = audio_data / np.max(np.abs(audio_data)) if np.max(np.abs(audio_data)) > 0 else audio_data
+        
+        # Detect pauses (simplified)
+        is_speech = np.abs(audio_data) > 0.1
+        pauses = np.diff(is_speech.astype(int))
+        pause_count = np.sum(pauses == 1)
+        
+        # Error analysis
+        matches = language_tool.check(transcription)
+        error_rate = len(matches) / word_count if word_count > 0 else 0
+        
+        return {
+            "speech_rate": round(speech_rate, 1),  # Words per minute
+            "speaking_time": round(duration, 1),   # Seconds
+            "pause_count": pause_count,
+            "error_rate": round(error_rate * 100, 1)  # Error percentage
+        }
+    except Exception as e:
+        return {
+            "speech_rate": 0,
+            "speaking_time": 0,
+            "pause_count": 0,
+            "error_rate": 0,
+            "error": str(e)
+        }
 
-def linguistic_analysis(text):
-    errors = language_tool.check(text)
-    words = text.split()
-    sentences = text.split('.')
+def generate_response(user_input, interests):
+    system_msg = TUTOR_PROMPT(interests)
+    messages = [system_msg] + chat_history + [{"role": "user", "content": user_input}]
     
-    return {
-        'error_rate': len(errors) / len(words),
-        'lexical_diversity': len(set(words)) / len(words),
-        'avg_sentence_length': statistics.mean([len(s.split()) for s in sentences if s])
-    }
+    try:
+        response = client.chat.completions.create(
+            messages=messages,
+            model="llama3-8b-8192",
+            temperature=0.7
+        )
+        full_response = response.choices[0].message.content
+        return parse_response(full_response)
+    except Exception as e:
+        return {"main": "Sorry, I couldn't process your request.", "improvements": "", "suggestions": ""}
 
-def generate_feedback(fluency_metrics, linguistic_metrics):
-    feedback = []
+def parse_response(response):
+    parts = {"main": "", "improvements": "", "suggestions": ""}
+    current_section = "main"
     
-    if fluency_metrics['speech_rate'] < 2.0:
-        feedback.append(f"**Pace:** Try speaking slightly faster. Current rate: {fluency_metrics['speech_rate']:.1f} words/second")
-    elif fluency_metrics['speech_rate'] > 3.5:
-        feedback.append(f"**Pace:** Consider slowing down a bit. Current rate: {fluency_metrics['speech_rate']:.1f} words/second")
+    for line in response.split('\n'):
+        if "##Improvements:" in line:
+            current_section = "improvements"
+            line = line.replace("##Improvements:", "").strip()
+        elif "##Suggestions:" in line:
+            current_section = "suggestions"
+            line = line.replace("##Suggestions:", "").strip()
+        
+        parts[current_section] += line + "\n"
     
-    if fluency_metrics['pause_frequency'] > 0.5:
-        feedback.append("**Fluency:** Work on reducing pauses between words for smoother speech")
-    
-    if linguistic_metrics['error_rate'] > 0.1:
-        feedback.append(f"**Accuracy:** Focus on grammatical accuracy. Error frequency: 1 per {1/linguistic_metrics['error_rate']:.1f} words")
-    
-    if linguistic_metrics['lexical_diversity'] < 0.5:
-        feedback.append("**Vocabulary:** Try to use a wider range of words in your responses")
-    
-    if linguistic_metrics['avg_sentence_length'] < 5:
-        feedback.append("**Complexity:** Aim for slightly longer, more complex sentences")
-    elif linguistic_metrics['avg_sentence_length'] > 15:
-        feedback.append("**Clarity:** Consider breaking up some longer sentences for clarity")
-    
-    return "\n".join(feedback) if feedback else "Great job! Keep practicing to maintain your skills."
+    # Ensure all parts are populated
+    parts = {key: value.strip() if value.strip() else "No feedback provided." for key, value in parts.items()}
+    return parts
 
-def process_conversation(audio_path):
+def process_conversation(audio_path, interests):
+    global user_interests, chat_history
+    user_interests = interests
+    
     try:
         # Speech to text
         user_text = speech_to_text(audio_path)
         
-        # Fluency and linguistic analysis
-        fluency_metrics = calculate_fluency(audio_path, user_text)
-        linguistic_metrics = linguistic_analysis(user_text)
-        feedback = generate_feedback(fluency_metrics, linguistic_metrics)
+        # Calculate fluency metrics
+        fluency_metrics = calculate_fluency_metrics(audio_path, user_text)
         
-        # Get tutoring response
-        raw_response = generate_response(user_text)
+        # Get response components
+        response_parts = generate_response(user_text, interests)
         
-        # Separate correction from main response
-        if "**Correction:**" in raw_response:
-            correction, response_text = raw_response.split("\n", 1)
-        else:
-            correction, response_text = "", raw_response
+        # Format fluency feedback
+        fluency_feedback = (
+            f"Speech Rate: {fluency_metrics['speech_rate']} words/min\n"
+            f"Speaking Time: {fluency_metrics['speaking_time']} seconds\n" 
+            f"Pause Count: {fluency_metrics['pause_count']}\n"
+            f"Error Rate: {fluency_metrics['error_rate']}% of words"
+        )
         
-        # Generate audio
-        audio_output = text_to_speech(response_text)
+        # Update chat history - format as tuples for Gradio Chatbot
+        new_history = []
+        new_history.extend([(user, asst) for user, asst in chat_history])  # Copy existing history
+        new_history.append((user_text, response_parts['main']))  # Add new exchange
         
-        # Format chat history for display
-        display_history = [
-            (chat_history[i]["content"], chat_history[i+1]["content"]) 
-            for i in range(0, len(chat_history)-1, 2)
-        ]
+        # Generate audio response for playback
+        audio_output = text_to_speech(response_parts['main'])
         
-        return user_text, response_text, correction, audio_output, feedback, display_history
+        # Update global chat history with dictionaries for the LLM context
+        chat_history.append({"role": "user", "content": user_text})
+        chat_history.append({"role": "assistant", "content": response_parts['main']})
+        
+        return (
+            user_text,
+            response_parts['main'],
+            response_parts['improvements'],
+            response_parts['suggestions'],
+            fluency_feedback,
+            audio_output,
+            new_history  # Return tuples for Gradio display
+        )
     
     except Exception as e:
-        return f"Error: {str(e)}", "", "", None, "", chat_history
+        return (
+            f"Error: {str(e)}",
+            "",
+            "",
+            "",
+            "",
+            None,
+            []  # Return empty chat history in case of error
+        )
 
 # Gradio Interface
 with gr.Blocks(theme=gr.themes.Soft()) as app:
-    gr.Markdown("# 🇬🇧 English Conversation Coach with Fluency Assessment")
+    gr.Markdown("""
+    # 🎯 Personalized English Coach  
+    *Start by sharing your interests below!*
+    """)
     
     with gr.Row():
-        mic = gr.Microphone(type="filepath", label="Record Your Speech")
-        submit_btn = gr.Button("Analyze & Respond", variant="primary")
+        interests_input = gr.Textbox(
+            label="Your Interests (e.g., technology, sports, movies)",
+            placeholder="What topics do you want to discuss?"
+        )
     
     with gr.Row():
-        user_text = gr.Textbox(label="Your Speech (Transcribed)")
-        response_text = gr.Textbox(label="Tutor's Response", interactive=False)
+        mic_input = gr.Microphone(type="filepath", label="Speak Now")
+        submit_btn = gr.Button("Send", variant="primary")
     
     with gr.Row():
-        correction_box = gr.Textbox(label="Grammar Feedback", visible=True)
-        fluency_feedback = gr.Textbox(label="Fluency Feedback", visible=True)
+        user_transcription_box = gr.Textbox(label="Your Message")
+        tutor_response_box = gr.Textbox(label="Tutor's Response")
     
-    audio_output = gr.HTML(label="Tutor's Voice Response")
-    history = gr.Chatbot(label="Conversation Flow")
+    with gr.Row():
+        gr.HTML("<h3 style='text-align:center'>Feedback Section</h3>")
     
+    with gr.Row():
+        improvements_box = gr.Textbox(label="Key Improvements", lines=2)
+        suggestions_box = gr.Textbox(label="Better Alternatives", lines=2)
+    
+    fluency_feedback_box = gr.Textbox(label="Fluency Metrics", lines=4)
+    
+    audio_output_player = gr.HTML(label="Voice Response")
+    
+    # Use standard Chatbot format without 'type' parameter
+    chat_history_display = gr.Chatbot(label="Conversation History")
+
     submit_btn.click(
         process_conversation,
-        inputs=mic,
-        outputs=[user_text, response_text, correction_box, audio_output, fluency_feedback, history]
+        inputs=[mic_input, interests_input],
+        outputs=[
+            user_transcription_box,
+            tutor_response_box,
+            improvements_box,
+            suggestions_box,
+            fluency_feedback_box,
+            audio_output_player,
+            chat_history_display
+        ]
     )
 
 app.launch()
